@@ -1,15 +1,14 @@
 /**
  * ================================================================
- *  NSE INDIA PROXY SERVER
- *  Express + Puppeteer — runs a real Chrome browser to get NSE
- *  session cookies, then proxies all API calls with those cookies.
+ *  NSE INDIA PROXY — Lightweight (no Puppeteer)
+ *  Uses multi-step cookie handshake to mimic a real browser.
+ *  Deploys on Render free tier in under 60 seconds.
  * ================================================================
  */
 
-const express   = require('express');
-const cors      = require('cors');
-const puppeteer = require('puppeteer');
-const fetch     = require('node-fetch');
+const express = require('express');
+const fetch   = require('node-fetch');
+const cors    = require('cors');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -21,7 +20,6 @@ const ALLOWED_ORIGINS = [
   'http://127.0.0.1',
   'null'
 ];
-
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin || ALLOWED_ORIGINS.includes(origin)) cb(null, true);
@@ -43,94 +41,124 @@ const ALLOWED_PATHS = [
   '/api/allIndices',
 ];
 
-// ── Session cache ─────────────────────────────────────────────
-let sessionCookies = '';
-let cookieExpiry   = 0;
-let browser        = null;
+const HEADERS = {
+  'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Connection':      'keep-alive',
+  'Upgrade-Insecure-Requests': '1',
+  'Sec-Fetch-Dest':  'document',
+  'Sec-Fetch-Mode':  'navigate',
+  'Sec-Fetch-Site':  'none',
+  'Cache-Control':   'max-age=0',
+};
 
-// ── Launch Puppeteer ──────────────────────────────────────────
-async function getBrowser() {
-  if (browser) {
-    try { await browser.version(); return browser; } catch { browser = null; }
+// ── Cookie cache ──────────────────────────────────────────────
+let cookieJar  = '';
+let cookieExp  = 0;
+let refreshing = false;
+
+// ── Multi-step NSE cookie handshake ──────────────────────────
+async function refreshCookies() {
+  if (refreshing) {
+    // Wait for ongoing refresh
+    await new Promise(r => setTimeout(r, 3000));
+    return cookieJar;
   }
-  console.log('🚀 Launching Puppeteer…');
-  browser = await puppeteer.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--no-first-run',
-      '--no-zygote',
-      '--single-process',
-      '--disable-extensions',
-      '--disable-background-networking',
-      '--disable-default-apps',
-      '--disable-sync',
-      '--metrics-recording-only',
-      '--mute-audio',
-      '--safebrowsing-disable-auto-update',
-    ]
-  });
-  return browser;
-}
-
-// ── Refresh NSE cookies via real browser ─────────────────────
-async function getNSECookies() {
-  const now = Date.now();
-  if (sessionCookies && now < cookieExpiry) return sessionCookies;
-
-  console.log('🔄 Fetching fresh NSE cookies…');
-  const b    = await getBrowser();
-  const page = await b.newPage();
+  refreshing = true;
+  console.log('🔄 Refreshing NSE cookies…');
 
   try {
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-    );
-    await page.setExtraHTTPHeaders({
-      'Accept-Language': 'en-US,en;q=0.9',
+    // Step 1: Hit homepage
+    const r1 = await fetch('https://www.nseindia.com/', {
+      headers: HEADERS,
+      redirect: 'follow',
     });
+    const c1 = extractCookies(r1);
 
-    await page.goto('https://www.nseindia.com', {
-      waitUntil: 'domcontentloaded',
-      timeout: 30000
+    await sleep(1200);
+
+    // Step 2: Hit market data page with cookies from step 1
+    const r2 = await fetch('https://www.nseindia.com/market-data/live-equity-market', {
+      headers: { ...HEADERS, 'Cookie': c1, 'Referer': 'https://www.nseindia.com/' },
+      redirect: 'follow',
     });
-    await new Promise(r => setTimeout(r, 3000));
+    const c2 = mergeCookies(c1, extractCookies(r2));
 
-    const cookies = await page.cookies();
-    sessionCookies = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-    cookieExpiry   = now + 20 * 60 * 1000;
+    await sleep(800);
 
-    console.log(`✅ Got ${cookies.length} cookies`);
-    return sessionCookies;
+    // Step 3: Hit a lightweight JSON endpoint to finalize session
+    const r3 = await fetch('https://www.nseindia.com/api/allIndices', {
+      headers: {
+        ...HEADERS,
+        'Accept':   'application/json, text/plain, */*',
+        'Referer':  'https://www.nseindia.com/',
+        'Cookie':   c2,
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-origin',
+      }
+    });
+    const c3 = mergeCookies(c2, extractCookies(r3));
+
+    cookieJar = c3 || c2 || c1;
+    cookieExp = Date.now() + 18 * 60 * 1000; // 18 min cache
+    console.log(`✅ Cookies refreshed (${cookieJar.length} chars), valid 18 min`);
+    return cookieJar;
+
+  } catch (err) {
+    console.error('❌ Cookie refresh failed:', err.message);
+    throw err;
   } finally {
-    await page.close();
+    refreshing = false;
   }
 }
 
-// ── Health check ──────────────────────────────────────────────
+function extractCookies(response) {
+  const raw = response.headers.raw?.()['set-cookie'] ||
+              (response.headers.get('set-cookie') ? [response.headers.get('set-cookie')] : []);
+  return raw.map(c => c.split(';')[0].trim()).filter(Boolean).join('; ');
+}
+
+function mergeCookies(base, incoming) {
+  if (!incoming) return base;
+  const map = {};
+  (base + '; ' + incoming).split(';').forEach(pair => {
+    const [k, ...v] = pair.trim().split('=');
+    if (k) map[k.trim()] = v.join('=').trim();
+  });
+  return Object.entries(map).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function getCookies() {
+  if (cookieJar && Date.now() < cookieExp) return cookieJar;
+  return refreshCookies();
+}
+
+// ── Health ────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
-    status: 'ok',
-    service: 'NSE Proxy (Puppeteer)',
-    cookiesCached: !!sessionCookies && Date.now() < cookieExpiry,
-    expiresIn: cookieExpiry ? Math.round((cookieExpiry - Date.now()) / 1000) + 's' : 'none'
+    status:      'ok',
+    service:     'NSE Proxy (lightweight)',
+    cookieReady: !!cookieJar && Date.now() < cookieExp,
+    expiresIn:   cookieExp ? Math.round((cookieExp - Date.now()) / 1000) + 's' : 'none'
   });
 });
 
 // ── Warmup ────────────────────────────────────────────────────
 app.get('/warmup', async (req, res) => {
   try {
-    await getNSECookies();
-    res.json({ status: 'ok', message: 'Cookies warmed up successfully' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    await refreshCookies();
+    res.json({ status: 'ok', message: 'Cookies ready!', chars: cookieJar.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
-// ── Proxy all /api/* to NSE ───────────────────────────────────
+// ── Main proxy ────────────────────────────────────────────────
 app.get('/api/*', async (req, res) => {
   const reqPath = req.path;
   const allowed = ALLOWED_PATHS.some(p => reqPath.startsWith(p));
@@ -140,10 +168,9 @@ app.get('/api/*', async (req, res) => {
   const nseUrl = NSE_BASE + reqPath + query;
   console.log('📡', nseUrl);
 
-  try {
-    let cookies = await getNSECookies();
-
-    for (let attempt = 1; attempt <= 2; attempt++) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const cookies  = await getCookies();
       const response = await fetch(nseUrl, {
         headers: {
           'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -151,16 +178,15 @@ app.get('/api/*', async (req, res) => {
           'Accept':          'application/json, text/plain, */*',
           'Accept-Language': 'en-US,en;q=0.9',
           'Cookie':          cookies,
-          'sec-fetch-dest':  'empty',
-          'sec-fetch-mode':  'cors',
-          'sec-fetch-site':  'same-origin',
+          'Sec-Fetch-Dest':  'empty',
+          'Sec-Fetch-Mode':  'cors',
+          'Sec-Fetch-Site':  'same-origin',
         }
       });
 
       if ((response.status === 401 || response.status === 403) && attempt === 1) {
-        console.log('⚠️  Auth error — refreshing cookies…');
-        sessionCookies = ''; cookieExpiry = 0;
-        cookies = await getNSECookies();
+        console.log('⚠️  Auth error — forcing cookie refresh…');
+        cookieJar = ''; cookieExp = 0;
         continue;
       }
 
@@ -169,25 +195,25 @@ app.get('/api/*', async (req, res) => {
         .set('Content-Type', 'application/json')
         .set('Cache-Control', 'no-store')
         .send(text);
+
+    } catch (err) {
+      if (attempt === 2) {
+        console.error('❌', err.message);
+        return res.status(502).json({ error: 'Proxy error', detail: err.message });
+      }
     }
-  } catch (err) {
-    console.error('❌', err.message);
-    res.status(502).json({ error: 'Proxy error', detail: err.message });
   }
 });
 
 // ── Start ─────────────────────────────────────────────────────
 app.listen(PORT, async () => {
-  console.log(`✅ NSE Proxy on port ${PORT}`);
+  console.log(`\n✅ NSE Proxy (lightweight) running on port ${PORT}`);
   try {
-    await getNSECookies();
-    console.log('🔥 Pre-warmed on startup');
+    await refreshCookies();
+    console.log('🔥 Pre-warmed and ready\n');
   } catch (e) {
-    console.warn('⚠️  Pre-warm failed:', e.message);
+    console.warn('⚠️  Pre-warm failed (will retry on first request):', e.message);
   }
 });
 
-process.on('SIGTERM', async () => {
-  if (browser) await browser.close();
-  process.exit(0);
-});
+process.on('SIGTERM', () => process.exit(0));
