@@ -393,16 +393,29 @@ function mergeCookieStr(base, incoming) {
 }
 
 // ── GET /fiidii ───────────────────────────────────────────────
-app.get('/fiidii', async (req, res) => {
-  const today = todayIST();
+// Cache rules:
+//   After market close (3:45 PM IST) → cache all day, only refresh next day
+//   During market hours               → cache for 5 minutes max
+let fiidiiLastFetch = 0; // timestamp of last actual fetch
 
-  // Serve from cache if same day and market is closed (data won't change)
+app.get('/fiidii', async (req, res) => {
+  const today    = todayIST();
+  const now      = Date.now();
+  const FIVE_MIN = 5 * 60 * 1000;
+
+  // ── After market close: serve cached data all day ─────────
   if (fiidiiCache && fiidiiCacheDate === today && marketClosedIST()) {
-    console.log('📦 FII/DII served from cache');
-    return res.json({ data: [fiidiiCache], cached: true });
+    return res.json({ data: [fiidiiCache], cached: true, nextFetch: 'tomorrow 9:15 AM IST' });
   }
 
-  // Fetch fresh data
+  // ── During market hours: serve cache if fetched < 5 min ago ─
+  if (fiidiiCache && fiidiiCacheDate === today && (now - fiidiiLastFetch) < FIVE_MIN) {
+    const secsAgo = Math.round((now - fiidiiLastFetch) / 1000);
+    return res.json({ data: [fiidiiCache], cached: true, cacheAgeSeconds: secsAgo });
+  }
+
+  // ── Fetch fresh (at most once per 5 min during market hours) ─
+  fiidiiLastFetch = now;
   const data = await fetchFiidiiFromNSE();
   res.json({ data: [data], cached: false });
 });
