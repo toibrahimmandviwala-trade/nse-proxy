@@ -3,24 +3,20 @@
  *  NSE INDIA PROXY SERVER
  *  Express + Puppeteer — runs a real Chrome browser to get NSE
  *  session cookies, then proxies all API calls with those cookies.
- *
- *  Deploy free on Render.com:
- *  1. Push this folder to GitHub
- *  2. New Web Service on Render → connect repo → Start Command: node server.js
  * ================================================================
  */
 
-const express    = require('express');
-const cors       = require('cors');
-const puppeteer  = require('puppeteer');
-const fetch      = require('node-fetch');
+const express   = require('express');
+const cors      = require('cors');
+const puppeteer = require('puppeteer');
+const fetch     = require('node-fetch');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── CORS — allow your Netlify app ─────────────────────────────
+// ── CORS ──────────────────────────────────────────────────────
 const ALLOWED_ORIGINS = [
-  'https://melodic-shortbread-a97330.netlify.app',  // ← your Netlify URL
+  'https://melodic-shortbread-a97330.netlify.app',
   'http://localhost',
   'http://127.0.0.1',
   'null'
@@ -33,11 +29,8 @@ app.use(cors({
   }
 }));
 
-app.use(express.json());
-
 // ── NSE config ────────────────────────────────────────────────
 const NSE_BASE = 'https://www.nseindia.com';
-
 const ALLOWED_PATHS = [
   '/api/quote-equity',
   '/api/historical/cm/equity',
@@ -50,19 +43,19 @@ const ALLOWED_PATHS = [
   '/api/allIndices',
 ];
 
-// ── Session cookie cache ──────────────────────────────────────
-let sessionCookies = '';    // "key=val; key2=val2" string
-let cookieExpiry   = 0;     // timestamp ms
-let browser        = null;  // shared Puppeteer browser instance
+// ── Session cache ─────────────────────────────────────────────
+let sessionCookies = '';
+let cookieExpiry   = 0;
+let browser        = null;
 
-// ── Puppeteer: launch browser once ───────────────────────────
+// ── Launch Puppeteer ──────────────────────────────────────────
 async function getBrowser() {
   if (browser) {
-    try { await browser.version(); return browser; } catch {}
+    try { await browser.version(); return browser; } catch { browser = null; }
   }
-  console.log('🚀 Launching Puppeteer browser…');
+  console.log('🚀 Launching Puppeteer…');
   browser = await puppeteer.launch({
-    headless: 'new',
+    headless: true,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -70,168 +63,131 @@ async function getBrowser() {
       '--disable-gpu',
       '--no-first-run',
       '--no-zygote',
-      '--single-process',    // important for Render free tier
+      '--single-process',
       '--disable-extensions',
+      '--disable-background-networking',
+      '--disable-default-apps',
+      '--disable-sync',
+      '--metrics-recording-only',
+      '--mute-audio',
+      '--safebrowsing-disable-auto-update',
     ]
   });
   return browser;
 }
 
-// ── Get fresh NSE session cookie via real browser visit ───────
+// ── Refresh NSE cookies via real browser ─────────────────────
 async function getNSECookies() {
   const now = Date.now();
-  if (sessionCookies && now < cookieExpiry) {
-    console.log('✅ Using cached NSE cookies');
-    return sessionCookies;
-  }
+  if (sessionCookies && now < cookieExpiry) return sessionCookies;
 
-  console.log('🔄 Refreshing NSE session cookies via Puppeteer…');
+  console.log('🔄 Fetching fresh NSE cookies…');
   const b    = await getBrowser();
   const page = await b.newPage();
 
   try {
-    // Set a real browser user-agent
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     );
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'en-US,en;q=0.9',
+    });
 
-    // Visit NSE homepage — this sets all required session cookies
     await page.goto('https://www.nseindia.com', {
-      waitUntil: 'networkidle2',
+      waitUntil: 'domcontentloaded',
       timeout: 30000
     });
+    await new Promise(r => setTimeout(r, 3000));
 
-    // Wait a moment for any JS-set cookies
-    await new Promise(r => setTimeout(r, 2000));
-
-    // Also visit the market data page to get additional cookies
-    await page.goto('https://www.nseindia.com/market-data/live-equity-market', {
-      waitUntil: 'networkidle2',
-      timeout: 20000
-    });
-
-    await new Promise(r => setTimeout(r, 1000));
-
-    // Extract cookies
     const cookies = await page.cookies();
     sessionCookies = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-    cookieExpiry   = now + 20 * 60 * 1000; // cache 20 minutes
+    cookieExpiry   = now + 20 * 60 * 1000;
 
-    console.log(`✅ Got ${cookies.length} NSE cookies, cached for 20 min`);
+    console.log(`✅ Got ${cookies.length} cookies`);
     return sessionCookies;
-
-  } catch (err) {
-    console.error('❌ Puppeteer cookie fetch failed:', err.message);
-    throw err;
   } finally {
     await page.close();
   }
 }
 
-// ── Health check endpoint ─────────────────────────────────────
+// ── Health check ──────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
-    service: 'NSE Proxy',
+    service: 'NSE Proxy (Puppeteer)',
     cookiesCached: !!sessionCookies && Date.now() < cookieExpiry,
-    cookieExpiresIn: cookieExpiry ? Math.round((cookieExpiry - Date.now()) / 1000) + 's' : 'none'
+    expiresIn: cookieExpiry ? Math.round((cookieExpiry - Date.now()) / 1000) + 's' : 'none'
   });
 });
 
-// ── Warm up endpoint (call once after deploy to prime cookies) ─
+// ── Warmup ────────────────────────────────────────────────────
 app.get('/warmup', async (req, res) => {
   try {
     await getNSECookies();
-    res.json({ status: 'warmed up', cookies: sessionCookies.length + ' chars' });
+    res.json({ status: 'ok', message: 'Cookies warmed up successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── Main proxy endpoint — handles all /api/* NSE paths ────────
+// ── Proxy all /api/* to NSE ───────────────────────────────────
 app.get('/api/*', async (req, res) => {
-  const reqPath = req.path; // e.g. /api/quote-equity
-
-  // Whitelist check
+  const reqPath = req.path;
   const allowed = ALLOWED_PATHS.some(p => reqPath.startsWith(p));
-  if (!allowed) {
-    return res.status(403).json({ error: 'Path not allowed: ' + reqPath });
-  }
+  if (!allowed) return res.status(403).json({ error: 'Path not allowed: ' + reqPath });
 
-  // Build NSE URL with original query string
-  const query  = req.url.replace(req.path, ''); // just the ?query=string part
+  const query  = req.url.replace(req.path, '');
   const nseUrl = NSE_BASE + reqPath + query;
-  console.log('📡 Proxying:', nseUrl);
+  console.log('📡', nseUrl);
 
   try {
-    const cookies = await getNSECookies();
+    let cookies = await getNSECookies();
 
-    // Retry once on failure (cookies may be stale)
     for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const response = await fetch(nseUrl, {
-          method: 'GET',
-          headers: {
-            'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Referer':         'https://www.nseindia.com/',
-            'Accept':          'application/json, text/plain, */*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection':      'keep-alive',
-            'Cookie':          cookies,
-            'sec-fetch-dest':  'empty',
-            'sec-fetch-mode':  'cors',
-            'sec-fetch-site':  'same-origin',
-          }
-        });
-
-        if (response.status === 401 || response.status === 403) {
-          if (attempt === 1) {
-            // Force cookie refresh and retry
-            console.log('⚠️  Auth error, refreshing cookies and retrying…');
-            sessionCookies = '';
-            cookieExpiry   = 0;
-            await getNSECookies();
-            continue;
-          }
+      const response = await fetch(nseUrl, {
+        headers: {
+          'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          'Referer':         'https://www.nseindia.com/',
+          'Accept':          'application/json, text/plain, */*',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Cookie':          cookies,
+          'sec-fetch-dest':  'empty',
+          'sec-fetch-mode':  'cors',
+          'sec-fetch-site':  'same-origin',
         }
+      });
 
-        const text = await response.text();
-        res.status(response.status)
-           .set('Content-Type', 'application/json')
-           .set('Cache-Control', 'no-store')
-           .send(text);
-        return;
-
-      } catch (fetchErr) {
-        if (attempt === 2) throw fetchErr;
+      if ((response.status === 401 || response.status === 403) && attempt === 1) {
+        console.log('⚠️  Auth error — refreshing cookies…');
+        sessionCookies = ''; cookieExpiry = 0;
+        cookies = await getNSECookies();
+        continue;
       }
-    }
 
+      const text = await response.text();
+      return res.status(response.status)
+        .set('Content-Type', 'application/json')
+        .set('Cache-Control', 'no-store')
+        .send(text);
+    }
   } catch (err) {
-    console.error('❌ Proxy error:', err.message);
-    res.status(502).json({ error: 'NSE fetch failed', detail: err.message });
+    console.error('❌', err.message);
+    res.status(502).json({ error: 'Proxy error', detail: err.message });
   }
 });
 
-// ── Start server ──────────────────────────────────────────────
+// ── Start ─────────────────────────────────────────────────────
 app.listen(PORT, async () => {
-  console.log(`\n✅ NSE Proxy server running on port ${PORT}`);
-  console.log(`   Health: http://localhost:${PORT}/`);
-  console.log(`   Warmup: http://localhost:${PORT}/warmup\n`);
-
-  // Pre-warm cookies on startup
+  console.log(`✅ NSE Proxy on port ${PORT}`);
   try {
     await getNSECookies();
-    console.log('🔥 Cookies pre-warmed on startup\n');
-  } catch (err) {
-    console.warn('⚠️  Pre-warm failed (will retry on first request):', err.message);
+    console.log('🔥 Pre-warmed on startup');
+  } catch (e) {
+    console.warn('⚠️  Pre-warm failed:', e.message);
   }
 });
 
-// ── Graceful shutdown ─────────────────────────────────────────
 process.on('SIGTERM', async () => {
-  console.log('Shutting down…');
   if (browser) await browser.close();
   process.exit(0);
 });
