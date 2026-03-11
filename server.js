@@ -280,25 +280,156 @@ app.get('/optionchain/:symbol', async (req, res) => {
   }
 });
 
-// ── GET /fiidii ───────────────────────────────────────────────
-// FII/DII not available via broker APIs — fetch from NSE directly
-// (only needed once/day, NSE is less aggressive about this endpoint)
-app.get('/fiidii', async (req, res) => {
-  try {
-    const r = await axios.get('https://www.nseindia.com/api/fiidiiTradeReact', {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer':    'https://www.nseindia.com/',
-        'Accept':     'application/json',
-      },
-      timeout: 8000
-    });
-    res.json(r.data);
-  } catch (e) {
-    // Return neutral on failure
-    res.json({ data: [{ fiiNet: 0, diiNet: 0 }] });
+// ── FII/DII daily cache ───────────────────────────────────────
+// Fetched once per day after market close (3:45 PM IST)
+// Uses multi-step NSE cookie handshake — same as original proxy
+// Cached in memory; survives multiple requests all day
+
+let fiidiiCache    = null;   // { fiiNet, diiNet, date, source }
+let fiidiiCacheDate = '';    // 'YYYY-MM-DD' of last successful fetch
+let fiidiiFetching  = false;
+
+function todayIST() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }); // YYYY-MM-DD
+}
+
+function marketClosedIST() {
+  // Returns true after 3:45 PM IST
+  const now = new Date();
+  const ist = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  return ist.getHours() > 15 || (ist.getHours() === 15 && ist.getMinutes() >= 45);
+}
+
+async function fetchFiidiiFromNSE() {
+  if (fiidiiFetching) {
+    await new Promise(r => setTimeout(r, 4000));
+    return fiidiiCache;
   }
+  fiidiiFetching = true;
+  console.log('📊 Fetching FII/DII from NSE (daily cache)…');
+
+  const BROWSER_HEADERS = {
+    'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Connection':      'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+  };
+
+  try {
+    // Step 1: Homepage cookie
+    const r1 = await axios.get('https://www.nseindia.com/', {
+      headers: BROWSER_HEADERS,
+      timeout: 10000,
+      maxRedirects: 5,
+    });
+    const c1 = extractCookieStr(r1);
+    await new Promise(r => setTimeout(r, 1500));
+
+    // Step 2: Market data page
+    const r2 = await axios.get('https://www.nseindia.com/market-data/live-equity-market', {
+      headers: { ...BROWSER_HEADERS, Cookie: c1, Referer: 'https://www.nseindia.com/' },
+      timeout: 10000,
+    });
+    const c2 = mergeCookieStr(c1, extractCookieStr(r2));
+    await new Promise(r => setTimeout(r, 1000));
+
+    // Step 3: Try FII/DII endpoints with fresh cookies
+    const ENDPOINTS = [
+      'https://www.nseindia.com/api/fiidiiTradeReact',
+      'https://www.nseindia.com/api/report-data/fii-dii-trading-activity',
+      'https://www.nseindia.com/api/fii-dii',
+    ];
+
+    for (const url of ENDPOINTS) {
+      try {
+        const r3 = await axios.get(url, {
+          headers: {
+            ...BROWSER_HEADERS,
+            Accept:           'application/json, text/plain, */*',
+            Referer:          'https://www.nseindia.com/',
+            Cookie:           c2,
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin',
+          },
+          timeout: 10000,
+        });
+
+        const row  = r3.data?.data?.[0] ?? r3.data?.[0] ?? r3.data ?? {};
+        const fiiNet = parseFloat(row.fiiNet ?? row.NET_FII ?? row.netFII ?? row.net ?? NaN);
+        const diiNet = parseFloat(row.diiNet ?? row.NET_DII ?? row.netDII ?? 0);
+
+        if (!isNaN(fiiNet)) {
+          fiidiiCache     = { fiiNet, diiNet, date: todayIST(), source: url };
+          fiidiiCacheDate = todayIST();
+          console.log(`✅ FII/DII cached — FII: ${fiiNet > 0 ? '+' : ''}${fiiNet} Cr, DII: ${diiNet > 0 ? '+' : ''}${diiNet} Cr`);
+          return fiidiiCache;
+        }
+      } catch { continue; }
+    }
+
+    throw new Error('All NSE FII/DII endpoints failed');
+
+  } catch (e) {
+    console.warn('⚠️  FII/DII fetch failed:', e.message);
+    // Return last cached value if available, else neutral
+    return fiidiiCache ?? { fiiNet: 0, diiNet: 0, date: null, source: 'fallback' };
+  } finally {
+    fiidiiFetching = false;
+  }
+}
+
+function extractCookieStr(response) {
+  const setCookie = response.headers['set-cookie'] ?? [];
+  return (Array.isArray(setCookie) ? setCookie : [setCookie])
+    .map(c => c.split(';')[0].trim()).filter(Boolean).join('; ');
+}
+
+function mergeCookieStr(base, incoming) {
+  if (!incoming) return base;
+  const map = {};
+  (base + '; ' + incoming).split(';').forEach(pair => {
+    const [k, ...v] = pair.trim().split('=');
+    if (k?.trim()) map[k.trim()] = v.join('=').trim();
+  });
+  return Object.entries(map).map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+// ── GET /fiidii ───────────────────────────────────────────────
+app.get('/fiidii', async (req, res) => {
+  const today = todayIST();
+
+  // Serve from cache if same day and market is closed (data won't change)
+  if (fiidiiCache && fiidiiCacheDate === today && marketClosedIST()) {
+    console.log('📦 FII/DII served from cache');
+    return res.json({ data: [fiidiiCache], cached: true });
+  }
+
+  // Fetch fresh data
+  const data = await fetchFiidiiFromNSE();
+  res.json({ data: [data], cached: false });
 });
+
+// ── Schedule daily FII/DII fetch at 4:00 PM IST ──────────────
+function scheduleDailyFiidii() {
+  const now    = new Date();
+  const ist    = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  const target = new Date(ist);
+  target.setHours(16, 0, 0, 0); // 4:00 PM IST
+
+  // If already past 4 PM today, schedule for tomorrow
+  if (ist >= target) target.setDate(target.getDate() + 1);
+
+  const msUntil = target - ist;
+  console.log(`⏰ Next FII/DII auto-fetch in ${Math.round(msUntil/1000/60)} minutes (4:00 PM IST)`);
+
+  setTimeout(async () => {
+    await fetchFiidiiFromNSE();
+    // Schedule next day
+    setInterval(fetchFiidiiFromNSE, 24 * 60 * 60 * 1000);
+  }, msUntil);
+}
 
 // ── Start ─────────────────────────────────────────────────────
 app.listen(PORT, async () => {
@@ -313,6 +444,10 @@ app.listen(PORT, async () => {
   } catch (e) {
     console.warn('⚠️  Pre-warm failed:', e.message);
   }
+
+  // Fetch FII/DII immediately on startup + schedule daily at 4 PM IST
+  fetchFiidiiFromNSE();
+  scheduleDailyFiidii();
 });
 
 process.on('SIGTERM', () => process.exit(0));
