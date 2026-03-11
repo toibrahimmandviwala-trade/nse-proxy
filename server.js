@@ -227,7 +227,7 @@ app.get('/historical/:symbol', async (req, res) => {
 
   // Date range: last 30 days
   const to   = new Date();
-  const from = new Date(); from.setDate(to.getDate() - 35);
+  const from = new Date(); from.setDate(to.getDate() - 90); // 90 days = ~60 trading candles
   const fmt  = d => d.toISOString().split('T')[0] + ' 09:00';
 
   try {
@@ -241,7 +241,7 @@ app.get('/historical/:symbol', async (req, res) => {
     }, { headers });
 
     const candles = r.data?.data ?? [];
-    const ohlc = candles.slice(-20).map(c => ({
+    const ohlc = candles.slice(-60).map(c => ({
       t: c[0].split('T')[0],
       o: c[1], h: c[2], l: c[3], c: c[4], v: c[5]
     }));
