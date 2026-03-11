@@ -102,6 +102,19 @@ const SYMBOL_TOKENS = {
   'MM':          '2031',
 };
 
+// ── MCX Commodity tokens (Angel One SmartAPI, exchange=MCX) ───
+const MCX_TOKENS = {
+  'CRUDEOIL': '234230',   // Crude Oil Near Month
+  'GOLD':     '234385',   // Gold Near Month  
+  'SILVER':   '234386',   // Silver Near Month
+};
+
+// ── Crypto symbols handled via CoinGecko (free, no key) ───────
+const CRYPTO_IDS = {
+  'BITCOIN':  'bitcoin',
+  'ETHEREUM': 'ethereum',
+};
+
 // ── Generate TOTP ─────────────────────────────────────────────
 function generateTOTP() {
   return authenticator.generate(ANGEL_TOTP_SECRET);
@@ -188,6 +201,42 @@ app.get('/warmup', async (req, res) => {
 // ── GET /quote/:symbol ────────────────────────────────────────
 app.get('/quote/:symbol', async (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
+
+  // ── Crypto: use CoinGecko ─────────────────────────────────
+  if (CRYPTO_IDS[symbol]) {
+    try {
+      const cgId = CRYPTO_IDS[symbol];
+      const r = await axios.get(`https://api.coingecko.com/api/v3/simple/price?ids=${cgId}&vs_currencies=inr&include_24hr_change=true&include_24hr_vol=true&include_market_cap=true`);
+      const d = r.data[cgId];
+      if (!d) return res.status(502).json({ error: 'CoinGecko: no data' });
+      const pChange = +(d.inr_24h_change || 0).toFixed(2);
+      return res.json({
+        symbol, lastPrice: d.inr, netChange: +(d.inr * pChange / 100).toFixed(2),
+        pChange, volume: d.inr_24h_vol || 0, dayHigh: +(d.inr * 1.02).toFixed(2),
+        dayLow:  +(d.inr * 0.98).toFixed(2), prevClose: +(d.inr / (1 + pChange/100)).toFixed(2),
+        isCrypto: true, marketCap: d.inr_market_cap,
+      });
+    } catch(e) { return res.status(502).json({ error: 'Crypto fetch failed: ' + e.message }); }
+  }
+
+  // ── MCX Commodities ────────────────────────────────────────
+  if (MCX_TOKENS[symbol]) {
+    try {
+      const headers = await smartHeaders();
+      const r = await axios.post(`${SMART_BASE}/rest/secure/angelbroking/market/v1/quote/`, {
+        mode: 'FULL', exchangeTokens: { MCX: [MCX_TOKENS[symbol]] }
+      }, { headers });
+      const d = r.data?.data?.fetched?.[0];
+      if (!d) return res.status(502).json({ error: 'MCX: no data for ' + symbol });
+      return res.json({
+        symbol, lastPrice: d.ltp, netChange: d.netChange,
+        pChange: d.percentChange, volume: d.tradeVolume || 0,
+        dayHigh: d.high, dayLow: d.low, prevClose: d.close,
+        isCommodity: true,
+      });
+    } catch(e) { return res.status(502).json({ error: 'MCX fetch failed: ' + e.message }); }
+  }
+
   const token  = SYMBOL_TOKENS[symbol];
   if (!token) return res.status(404).json({ error: 'Symbol not found: ' + symbol });
 
@@ -221,14 +270,50 @@ app.get('/quote/:symbol', async (req, res) => {
 // ── GET /historical/:symbol ───────────────────────────────────
 app.get('/historical/:symbol', async (req, res) => {
   const symbol    = req.params.symbol.toUpperCase();
-  const token     = SYMBOL_TOKENS[symbol];
   const interval  = req.query.interval || 'ONE_DAY';
+
+  // ── Crypto historical via CoinGecko ───────────────────────
+  if (CRYPTO_IDS[symbol]) {
+    try {
+      const cgId = CRYPTO_IDS[symbol];
+      const r = await axios.get(`https://api.coingecko.com/api/v3/coins/${cgId}/ohlc?vs_currency=inr&days=60`);
+      // CoinGecko returns [timestamp, open, high, low, close]
+      const ohlc = r.data.map(d => ({
+        t: new Date(d[0]).toISOString().split('T')[0],
+        o: d[1], h: d[2], l: d[3], c: d[4], v: 0,
+      }));
+      return res.json({ symbol, data: ohlc });
+    } catch(e) { return res.status(502).json({ error: 'Crypto historical failed: ' + e.message }); }
+  }
+
+  // ── MCX Commodities historical ────────────────────────────
+  if (MCX_TOKENS[symbol]) {
+    try {
+      const headers = await smartHeaders();
+      const to   = new Date();
+      const from = new Date(); from.setDate(to.getDate() - 90);
+      const fmt  = d => d.toISOString().split('T')[0] + ' 09:00';
+      const fmtTo = d => d.toISOString().split('T')[0] + ' 23:30';
+      const r = await axios.post(`${SMART_BASE}/rest/secure/angelbroking/historical/v1/getCandleData`, {
+        exchange: 'MCX', symboltoken: MCX_TOKENS[symbol],
+        interval: 'ONE_DAY', fromdate: fmt(from), todate: fmtTo(to),
+      }, { headers });
+      const candles = r.data?.data ?? [];
+      const ohlc = candles.slice(-60).map(c => ({
+        t: c[0].split('T')[0], o: c[1], h: c[2], l: c[3], c: c[4], v: c[5]
+      }));
+      return res.json({ symbol, data: ohlc });
+    } catch(e) { return res.status(502).json({ error: 'MCX historical failed: ' + e.message }); }
+  }
+
+  const token     = SYMBOL_TOKENS[symbol];
   if (!token) return res.status(404).json({ error: 'Symbol not found: ' + symbol });
 
   // Date range: last 30 days
   const to   = new Date();
   const from = new Date(); from.setDate(to.getDate() - 90); // 90 days = ~60 trading candles
-  const fmt  = d => d.toISOString().split('T')[0] + ' 09:00';
+  const fmt  = d => d.toISOString().split('T')[0] + ' 09:15';
+  const fmtTo = d => d.toISOString().split('T')[0] + ' 15:30';
 
   try {
     const headers = await smartHeaders();
@@ -237,7 +322,7 @@ app.get('/historical/:symbol', async (req, res) => {
       symboltoken: token,
       interval,
       fromdate:    fmt(from),
-      todate:      fmt(to),
+      todate:      fmtTo(to),
     }, { headers });
 
     const candles = r.data?.data ?? [];
@@ -256,6 +341,10 @@ app.get('/historical/:symbol', async (req, res) => {
 // ── GET /optionchain/:symbol ──────────────────────────────────
 app.get('/optionchain/:symbol', async (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
+  // Commodities and Crypto have no NSE option chain
+  if (MCX_TOKENS[symbol] || CRYPTO_IDS[symbol]) {
+    return res.json({ symbol, pcr: 1.0, note: 'No option chain for commodities/crypto' });
+  }
 
   try {
     const headers = await smartHeaders();
