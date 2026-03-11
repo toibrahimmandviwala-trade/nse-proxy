@@ -3,9 +3,13 @@ services:
     name: nse-proxy
     env: node
     plan: free
+    region: singapore
     buildCommand: npm install
     startCommand: node server.js
     envVars:
       - key: NODE_ENV
         value: production
+      - key: PUPPETEER_CACHE_DIR
+        value: /opt/render/.cache/puppeteer
     healthCheckPath: /
+
