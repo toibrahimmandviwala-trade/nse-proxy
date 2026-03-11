@@ -97,6 +97,8 @@ const SYMBOL_TOKENS = {
   'SAIL':        '2963',
   'NATIONALUM':  '9819',
   'HINDZINC':    '1747',
+  'NIFTY':       '26000',
+  'BANKNIFTY':   '26009',
   'MM':          '2031',
 };
 
@@ -439,6 +441,32 @@ function scheduleDailyFiidii() {
     setInterval(fetchFiidiiFromNSE, 24 * 60 * 60 * 1000);
   }, msUntil);
 }
+
+
+// ── In-memory journal store (persists while server is up) ─────
+// Free tier sleeps after inactivity — also saves to client localStorage as backup
+let journalData = { trades: [] };
+
+// ── GET /journal ──────────────────────────────────────────────
+app.get('/journal', (req, res) => {
+  res.json(journalData);
+});
+
+// ── POST /journal ─────────────────────────────────────────────
+app.post('/journal', (req, res) => {
+  try {
+    const body = req.body;
+    if (body && Array.isArray(body.trades)) {
+      journalData = body;
+      console.log(`📓 Journal saved — ${body.trades.length} trades`);
+      res.json({ ok: true, count: body.trades.length });
+    } else {
+      res.status(400).json({ error: 'Invalid journal data' });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ── Start ─────────────────────────────────────────────────────
 app.listen(PORT, async () => {
