@@ -1,7 +1,6 @@
 {
   "name": "nse-proxy",
   "version": "1.0.0",
-  "description": "NSE India proxy server using Puppeteer for real browser session",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
