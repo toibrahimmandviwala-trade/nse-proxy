@@ -103,11 +103,34 @@ const SYMBOL_TOKENS = {
 };
 
 // ── MCX Commodity tokens (Angel One SmartAPI, exchange=MCX) ───
+// MCX tokens — front-month contracts. Refreshed dynamically at startup.
 const MCX_TOKENS = {
-  'CRUDEOIL': '234230',   // Crude Oil Near Month
-  'GOLD':     '234385',   // Gold Near Month  
-  'SILVER':   '234386',   // Silver Near Month
+  'CRUDEOIL': '234230',
+  'GOLD':     '234385',
+  'SILVER':   '234386',
 };
+
+// Refresh MCX tokens to get current active near-month contract IDs
+async function refreshMCXTokens() {
+  try {
+    const headers = await smartHeaders();
+    for (const sym of ['GOLD', 'SILVER', 'CRUDEOIL']) {
+      try {
+        const r = await axios.get(
+          `${SMART_BASE}/rest/secure/angelbroking/order/v1/searchScrip?exchange=MCX&searchscrip=${sym}`,
+          { headers, timeout: 5000 }
+        );
+        const items = (r.data?.data || []).filter(i => i.exch_seg === 'MCX');
+        // Sort by expiry ascending, pick nearest active contract
+        items.sort((a, b) => (a.expiry || '').localeCompare(b.expiry || ''));
+        if (items.length) {
+          MCX_TOKENS[sym] = items[0].token;
+          console.log(`MCX ${sym}: token=${items[0].token} symbol=${items[0].symbol} expiry=${items[0].expiry}`);
+        }
+      } catch(e) { console.warn(`MCX token refresh skipped for ${sym}:`, e.message); }
+    }
+  } catch(e) { console.warn('MCX refresh failed, using static tokens:', e.message); }
+}
 
 // ── Crypto symbols handled via CoinGecko (free, no key) ───────
 const CRYPTO_IDS = {
@@ -163,7 +186,8 @@ async function getToken() {
 }
 
 // ── SmartAPI headers ──────────────────────────────────────────
-async function smartHeaders() {
+async function smartHeaders(forceRefresh = false) {
+  if (forceRefresh) { jwtToken = ''; sessionExp = 0; }
   const token = await getToken();
   return {
     'Authorization':   `Bearer ${token}`,
@@ -184,8 +208,39 @@ app.get('/', (req, res) => {
     status:       'ok',
     service:      'NSE Proxy (Angel One SmartAPI)',
     sessionReady: !!jwtToken && Date.now() < sessionExp,
-    expiresIn:    sessionExp ? Math.round((sessionExp - Date.now()) / 1000 / 60) + ' min' : 'none'
+    expiresIn:    sessionExp ? Math.round((sessionExp - Date.now()) / 1000 / 60) + ' min' : 'none',
+    mcxTokens:    MCX_TOKENS,
   });
+});
+
+// ── GET /debug — full diagnostic ─────────────────────────────
+app.get('/debug', async (req, res) => {
+  const sym = ((req.query.symbol) || 'NIFTY').toUpperCase();
+  const result = { timestamp: new Date().toISOString(), symbol: sym, tests: {} };
+  try {
+    const tok = await getToken();
+    result.tests.auth = { ok: true, tokenLen: tok.length, expiresIn: Math.round((sessionExp - Date.now())/60000) + 'min' };
+  } catch(e) { result.tests.auth = { ok: false, error: e.message }; }
+  try {
+    const h = await smartHeaders();
+    const tkn = SYMBOL_TOKENS[sym] || '26000';
+    const r = await axios.post(`${SMART_BASE}/rest/secure/angelbroking/market/v1/quote/`,
+      { mode:'FULL', exchangeTokens:{ NSE:[tkn] } }, { headers: h });
+    result.tests.nseQuote = { ok: true, ltp: r.data?.data?.fetched?.[0]?.ltp, errorcode: r.data?.errorcode };
+  } catch(e) { result.tests.nseQuote = { ok: false, error: e.message }; }
+  try {
+    const h = await smartHeaders();
+    const r = await axios.post(`${SMART_BASE}/rest/secure/angelbroking/market/v1/quote/`,
+      { mode:'FULL', exchangeTokens:{ MCX:[MCX_TOKENS['GOLD']] } }, { headers: h });
+    result.tests.mcxGold = { ok: true, token: MCX_TOKENS['GOLD'], ltp: r.data?.data?.fetched?.[0]?.ltp, errorcode: r.data?.errorcode };
+  } catch(e) { result.tests.mcxGold = { ok: false, token: MCX_TOKENS['GOLD'], error: e.message }; }
+  try {
+    const r = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=inr&include_24hr_change=true', { timeout: 8000 });
+    result.tests.coingecko = { ok: true, btcInr: r.data?.bitcoin?.inr };
+  } catch(e) { result.tests.coingecko = { ok: false, error: e.message }; }
+  result.mcxTokens = MCX_TOKENS;
+  result.sessionExpiry = sessionExp ? new Date(sessionExp).toISOString() : 'none';
+  res.json(result);
 });
 
 // ── Warmup ────────────────────────────────────────────────────
@@ -226,8 +281,15 @@ app.get('/quote/:symbol', async (req, res) => {
       const r = await axios.post(`${SMART_BASE}/rest/secure/angelbroking/market/v1/quote/`, {
         mode: 'FULL', exchangeTokens: { MCX: [MCX_TOKENS[symbol]] }
       }, { headers });
-      const d = r.data?.data?.fetched?.[0];
-      if (!d) return res.status(502).json({ error: 'MCX: no data for ' + symbol });
+      let d = r.data?.data?.fetched?.[0];
+      if (!d && r.data?.errorcode) {
+        // Session may have expired — re-login and retry
+        const h2 = await smartHeaders(true);
+        const r2 = await axios.post(`${SMART_BASE}/rest/secure/angelbroking/market/v1/quote/`,
+          { mode: 'FULL', exchangeTokens: { MCX: [MCX_TOKENS[symbol]] } }, { headers: h2 });
+        d = r2.data?.data?.fetched?.[0];
+      }
+      if (!d) return res.status(502).json({ error: 'MCX: no data for ' + symbol + ' (token:' + MCX_TOKENS[symbol] + ')' });
       return res.json({
         symbol, lastPrice: d.ltp, netChange: d.netChange,
         pChange: d.percentChange, volume: d.tradeVolume || 0,
@@ -247,8 +309,16 @@ app.get('/quote/:symbol', async (req, res) => {
       exchangeTokens: { NSE: [token] }
     }, { headers });
 
-    const d = r.data?.data?.fetched?.[0];
-    if (!d) throw new Error('No quote data returned');
+    let d = r.data?.data?.fetched?.[0];
+    // If session expired mid-run, re-login once and retry
+    if (!d && (r.data?.errorcode || r.data?.status === false)) {
+      console.warn('Session issue detected, re-logging in for', symbol);
+      const h2 = await smartHeaders(true);
+      const r2 = await axios.post(`${SMART_BASE}/rest/secure/angelbroking/market/v1/quote/`,
+        { mode: 'FULL', exchangeTokens: { NSE: [token] } }, { headers: h2 });
+      d = r2.data?.data?.fetched?.[0];
+    }
+    if (!d) throw new Error('No quote data from SmartAPI for ' + symbol);
 
     res.json({
       symbol:    symbol,
@@ -566,7 +636,8 @@ app.listen(PORT, async () => {
   }
   try {
     await login();
-    console.log('🔥 SmartAPI session pre-warmed\n');
+    await refreshMCXTokens();
+    console.log('🔥 SmartAPI session pre-warmed + MCX tokens refreshed\n');
   } catch (e) {
     console.warn('⚠️  Pre-warm failed:', e.message);
   }
